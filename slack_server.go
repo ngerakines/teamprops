@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/kr/pretty"
@@ -88,14 +89,16 @@ func (s *SlackServer) Run() error {
 				}
 
 				if isProps(ev.Msg.Text) {
-					messageID, err := s.createProps(ev.Msg.Channel, ev.Msg.User, ev.Msg.Timestamp, ev.Msg.Text)
+					theme := selectTheme()
+					users := usersFromMessage(ev.Msg.Text)
+					messageID, err := s.createProps(ev.Msg.Channel, ev.Msg.User, ev.Msg.Timestamp, ev.Msg.Text, theme.id)
 					if err != nil {
 						s.Logger.WithError(err).Error("Error creating props record.")
 					}
 					rtm.SendMessage(&slack.OutgoingMessage{
 						ID:      messageID,
 						Channel: ev.Channel,
-						Text:    "Got some props: " + ev.Msg.Text,
+						Text:    theme.FullMessage(users),
 						Type:    "message",
 					})
 				}
@@ -108,25 +111,38 @@ func (s *SlackServer) Run() error {
 				}
 
 				var channel string
-				err := s.DB.QueryRow("SELECT target_channel FROM props WHERE id = $1", ev.ReplyTo).Scan(&channel)
+				var theme int
+				err := s.DB.QueryRow("SELECT target_channel, theme FROM props WHERE id = $1", ev.ReplyTo).Scan(&channel, &theme)
 				if err != nil {
 					s.Logger.WithError(err).Error("Error recording reply.")
 					break
 				}
 
-				rtm.AddReaction("fire", slack.ItemRef{
-					Channel:   channel,
-					Timestamp: ev.Timestamp,
-				})
-				rtm.AddReaction("tada", slack.ItemRef{
-					Channel:   channel,
-					Timestamp: ev.Timestamp,
-				})
+				messageTheme := themes[theme]
+				if len(messageTheme.reactions) > 0 {
+					for _, reaction := range messageTheme.reactions {
+						rtm.AddReaction(reaction, slack.ItemRef{
+							Channel:   channel,
+							Timestamp: ev.Timestamp,
+						})
+					}
+				} else {
+					for _, reaction := range getReactions() {
+						rtm.AddReaction(reaction, slack.ItemRef{
+							Channel:   channel,
+							Timestamp: ev.Timestamp,
+						})
+					}
+				}
 				break
 
 			case *slack.ReactionAddedEvent:
 				if ev.ItemUser != s.myID {
 					s.Logger.Debug("Item added to someone else's event.")
+					break
+				}
+				if ev.User == s.myID {
+					s.Logger.Debug("This is my own automated reaction.")
 					break
 				}
 
@@ -179,12 +195,12 @@ func (s *SlackServer) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (s *SlackServer) createProps(channel, author, timestamp, message string) (int, error) {
+func (s *SlackServer) createProps(channel, author, timestamp, message string, theme int) (int, error) {
 	query := `INSERT INTO
 		props
-			(source_author, source_timestamp, source_message, source_channel, target_channel)
+			(source_author, source_timestamp, source_message, source_channel, target_channel, theme)
 		VALUES
-			($1, $2, $3, $4, $5)
+			($1, $2, $3, $4, $5, $6)
 		RETURNING id`
 
 	stmt, err := s.DB.Prepare(query)
@@ -194,7 +210,7 @@ func (s *SlackServer) createProps(channel, author, timestamp, message string) (i
 	defer stmt.Close()
 
 	var messageID int
-	err = stmt.QueryRow(author, timestamp, message, channel, channel).Scan(&messageID)
+	err = stmt.QueryRow(author, timestamp, message, channel, channel, theme).Scan(&messageID)
 	if err != nil {
 		return 0, err
 	}
@@ -251,4 +267,13 @@ func isProps(input string) bool {
 		}
 	}
 	return false
+}
+
+func usersFromMessage(input string) []string {
+	re := regexp.MustCompile(`(<@[^>]+>)`)
+	if matches := re.FindAllString(input, -1); matches != nil {
+		return matches
+	}
+
+	return []string{}
 }

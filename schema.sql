@@ -1,5 +1,6 @@
 CREATE TABLE props (
     id bigserial PRIMARY KEY,
+    theme int DEFAULT 0 NOT NULL,
 
     source_author  character varying(64) NOT NULL,
     source_timestamp character varying(64) NOT NULL,
