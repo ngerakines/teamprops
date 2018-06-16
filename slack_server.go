@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/kr/pretty"
@@ -95,12 +96,35 @@ func (s *SlackServer) Run() error {
 					out := rtm.NewOutgoingMessage(theme.FullMessage(users), ev.Channel)
 					if err := s.createProps(s.ConnectionKey, ev.Msg.Channel, ev.Msg.User, ev.Msg.Timestamp, ev.Msg.Text, theme.id, out.ID); err != nil {
 						s.Logger.WithError(err).Error("Error creating props record.")
+						break
 					}
 					rtm.SendMessage(out)
 					break
 				}
 				if s.isLeaderboard(ev.Msg.Text) {
-					rtm.SendMessage(rtm.NewOutgoingMessage("Pretend this is a leaderboard.", ev.Channel))
+					givePairs, err := s.topPropsGivers()
+					if err != nil {
+						s.Logger.WithError(err).Error("Error creating leaderboard")
+						break
+					}
+					message := "Props given: \n"
+					for i, pair := range givePairs {
+						if i < 3 {
+							message += fmt.Sprintf("%d. <@%s> %d\n", i+1, pair.Author, pair.Value)
+						}
+					}
+					recvPairs, err := s.topPropsReceivers()
+					if err != nil {
+						s.Logger.WithError(err).Error("Error creating leaderboard")
+						break
+					}
+					message += "Props received: \n"
+					for i, pair := range recvPairs {
+						if i < 3 {
+							message += fmt.Sprintf("%d. <@%s> %d\n", i+1, pair.Author, pair.Value)
+						}
+					}
+					rtm.SendMessage(rtm.NewOutgoingMessage(message, ev.Channel))
 				}
 				break
 
@@ -275,6 +299,133 @@ func (s *SlackServer) isLeaderboard(input string) bool {
 		return strings.Index(strings.ToLower(input), "leaderboard") > 0
 	}
 	return false
+}
+
+func (s *SlackServer) topPropsGivers() (AuthorMetricPairList, error) {
+	query := `SELECT source_author, COUNT(*) AS count FROM props GROUP BY source_author;
+	SELECT reaction_user, COUNT(*) AS count FROM reactions GROUP BY reaction_user;`
+	rows, err := s.DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	results := map[string]int{}
+
+	for rows.Next() {
+		var (
+			author string
+			count  int
+		)
+		if err := rows.Scan(&author, &count); err != nil {
+			return nil, err
+		}
+		results[author] = count
+	}
+
+	if !rows.NextResultSet() {
+		return nil, fmt.Errorf("expected more database results")
+	}
+
+	for rows.Next() {
+		var (
+			author string
+			count  int
+		)
+		if err := rows.Scan(&author, &count); err != nil {
+			return nil, err
+		}
+		value, ok := results[author]
+		if ok {
+			results[author] = value + count
+		} else {
+			results[author] = count
+		}
+	}
+
+	pairs := make(AuthorMetricPairList, 0, len(results))
+	for author, count := range results {
+		pairs = append(pairs, AuthorMetricPair{author, count})
+	}
+	sort.Sort(sort.Reverse(pairs))
+
+	return pairs, nil
+}
+
+func (s *SlackServer) collectUsersFromMessages() (map[string][]string, error) {
+	query := `SELECT target_timestamp, source_message FROM props`
+	rows, err := s.DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	results := make(map[string][]string)
+
+	for rows.Next() {
+		var (
+			timestamp string
+			message   string
+		)
+		if err := rows.Scan(&timestamp, &message); err != nil {
+			return nil, err
+		}
+		results[timestamp] = usersFromMessage(message)
+	}
+	return results, nil
+}
+
+func (s *SlackServer) topPropsReceivers() (AuthorMetricPairList, error) {
+	messageUsers, err := s.collectUsersFromMessages()
+	if err != nil {
+		return nil, err
+	}
+
+	userProps := make(map[string]int)
+
+	for _, users := range messageUsers {
+		for _, user := range users {
+			value, ok := userProps[user]
+			if ok {
+				userProps[user] = value + 1
+			} else {
+				userProps[user] = 1
+			}
+		}
+	}
+
+	query := `select message_timestamp, count(*) as count from reactions group by message_timestamp;`
+	rows, err := s.DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			timestamp string
+			count     int
+		)
+		if err := rows.Scan(&timestamp, &count); err != nil {
+			return nil, err
+		}
+		if users, ok := messageUsers[timestamp]; ok {
+			for _, user := range users {
+				value, ok := userProps[user]
+				if ok {
+					userProps[user] = value + count
+				} else {
+					userProps[user] = 1
+				}
+			}
+		}
+	}
+
+	pairs := make(AuthorMetricPairList, 0, len(userProps))
+	for author, count := range userProps {
+		pairs = append(pairs, AuthorMetricPair{author, count})
+	}
+	sort.Sort(sort.Reverse(pairs))
+
+	return pairs, nil
 }
 
 func usersFromMessage(input string) []string {
