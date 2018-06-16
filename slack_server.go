@@ -13,9 +13,10 @@ import (
 )
 
 type SlackServer struct {
-	API    *slack.Client
-	DB     *sql.DB
-	Logger *logrus.Logger
+	API           *slack.Client
+	DB            *sql.DB
+	Logger        *logrus.Logger
+	ConnectionKey string
 
 	Stop chan struct{}
 
@@ -85,34 +86,37 @@ func (s *SlackServer) Run() error {
 					Debug("Message received")
 
 				if ev.User == s.myID {
-					s.Logger.Info("Ignoring one of my own messages.")
+					s.Logger.Debug("Ignoring one of my own messages.")
 				}
 
 				if isProps(ev.Msg.Text) {
 					theme := selectTheme()
 					users := usersFromMessage(ev.Msg.Text)
-					messageID, err := s.createProps(ev.Msg.Channel, ev.Msg.User, ev.Msg.Timestamp, ev.Msg.Text, theme.id)
-					if err != nil {
+					out := rtm.NewOutgoingMessage(theme.FullMessage(users), ev.Channel)
+					if err := s.createProps(s.ConnectionKey, ev.Msg.Channel, ev.Msg.User, ev.Msg.Timestamp, ev.Msg.Text, theme.id, out.ID); err != nil {
 						s.Logger.WithError(err).Error("Error creating props record.")
 					}
-					rtm.SendMessage(&slack.OutgoingMessage{
-						ID:      messageID,
-						Channel: ev.Channel,
-						Text:    theme.FullMessage(users),
-						Type:    "message",
-					})
+					rtm.SendMessage(out)
+					break
+				}
+				if s.isLeaderboard(ev.Msg.Text) {
+					rtm.SendMessage(rtm.NewOutgoingMessage("Pretend this is a leaderboard.", ev.Channel))
 				}
 				break
 
 			case *slack.AckMessage:
-				if err := s.updatePropsReply(ev.ReplyTo, ev.Timestamp); err != nil {
+				updated, err := s.updatePropsReply(s.ConnectionKey, ev.ReplyTo, ev.Timestamp)
+				if err != nil {
 					s.Logger.WithError(err).Error("Error recording reply.")
+					break
+				}
+				if !updated {
 					break
 				}
 
 				var channel string
 				var theme int
-				err := s.DB.QueryRow("SELECT target_channel, theme FROM props WHERE id = $1", ev.ReplyTo).Scan(&channel, &theme)
+				err = s.DB.QueryRow("SELECT target_channel, theme FROM props WHERE connection_key = $1 AND connection_id = $2", s.ConnectionKey, ev.ReplyTo).Scan(&channel, &theme)
 				if err != nil {
 					s.Logger.WithError(err).Error("Error recording reply.")
 					break
@@ -195,34 +199,32 @@ func (s *SlackServer) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (s *SlackServer) createProps(channel, author, timestamp, message string, theme int) (int, error) {
+func (s *SlackServer) createProps(connectionKey, channel, author, timestamp, message string, theme, messageID int) error {
 	query := `INSERT INTO
 		props
-			(source_author, source_timestamp, source_message, source_channel, target_channel, theme)
+			(connection_key, connection_id, source_author, source_timestamp, source_message, source_channel, target_channel, theme)
 		VALUES
-			($1, $2, $3, $4, $5, $6)
-		RETURNING id`
+			($1, $2, $3, $4, $5, $6, $7, $8)`
 
-	stmt, err := s.DB.Prepare(query)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-
-	var messageID int
-	err = stmt.QueryRow(author, timestamp, message, channel, channel, theme).Scan(&messageID)
-	if err != nil {
-		return 0, err
-	}
-	return messageID, nil
-}
-
-func (s *SlackServer) updatePropsReply(id int, timestamp string) error {
-	_, err := s.DB.Exec("UPDATE props SET target_timestamp = $1, updated_at = NOW() WHERE id = $2", timestamp, id)
-	if err != nil {
+	if _, err := s.DB.Exec(query, connectionKey, messageID, author, timestamp, message, channel, channel, theme); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *SlackServer) updatePropsReply(connectionKey string, messageID int, timestamp string) (bool, error) {
+	var count int
+	err := s.DB.QueryRow("SELECT COUNT(*) FROM props WHERE connection_key = $1 AND connection_id = $2", connectionKey, messageID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	if count == 0 {
+		return false, nil
+	}
+	if _, err := s.DB.Exec("UPDATE props SET target_timestamp = $1, updated_at = NOW() WHERE connection_key = $2 AND connection_id = $3", timestamp, connectionKey, messageID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *SlackServer) createReaction(channel, author, timestamp, reaction string) error {
@@ -234,8 +236,7 @@ func (s *SlackServer) createReaction(channel, author, timestamp, reaction string
 		ON CONFLICT (channel, message_timestamp, reaction_user, reaction)
 		DO UPDATE SET removed = false`
 
-	_, err := s.DB.Exec(query, channel, timestamp, author, reaction)
-	if err != nil {
+	if _, err := s.DB.Exec(query, channel, timestamp, author, reaction); err != nil {
 		return err
 	}
 	return nil
@@ -252,8 +253,7 @@ func (s *SlackServer) removeReaction(channel, author, timestamp, reaction string
 		AND reaction_user = $3
 		AND reaction = $4`
 
-	_, err := s.DB.Exec(query, channel, timestamp, author, reaction)
-	if err != nil {
+	if _, err := s.DB.Exec(query, channel, timestamp, author, reaction); err != nil {
 		return err
 	}
 	return nil
@@ -262,9 +262,17 @@ func (s *SlackServer) removeReaction(channel, author, timestamp, reaction string
 func isProps(input string) bool {
 	prefixes := []string{"props", "kudos", "congrats"}
 	for _, prefix := range prefixes {
-		if strings.HasPrefix(input, prefix) {
+		if strings.HasPrefix(strings.ToLower(input), prefix) {
 			return true
 		}
+	}
+	return false
+}
+
+func (s *SlackServer) isLeaderboard(input string) bool {
+	mention := fmt.Sprintf("<@%s>", s.myID)
+	if strings.HasPrefix(input, mention) {
+		return strings.Index(strings.ToLower(input), "leaderboard") > 0
 	}
 	return false
 }

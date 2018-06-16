@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	_ "github.com/lib/pq"
+	uuid "github.com/satori/go.uuid"
 
 	"github.com/apex/log"
 	"github.com/ngerakines/teamprops"
@@ -45,11 +46,17 @@ var serverCmd = &cobra.Command{
 			return fmt.Errorf("token not provided")
 		}
 
+		connectionKey, err := uuid.NewV4()
+		if token == "" {
+			return err
+		}
+
 		slackListener := &teamprops.SlackServer{
-			DB:     db,
-			API:    slack.New(token),
-			Logger: logger,
-			Stop:   make(chan struct{}),
+			DB:            db,
+			API:           slack.New(token),
+			Logger:        logger,
+			Stop:          make(chan struct{}),
+			ConnectionKey: connectionKey.String(),
 		}
 
 		wg.Add(1)
